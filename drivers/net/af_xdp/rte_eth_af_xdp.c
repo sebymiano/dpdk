@@ -126,6 +126,8 @@ struct pmd_internals {
 	int max_queue_cnt;
 	int combined_queue_cnt;
 	bool shared_umem;
+	bool use_pinned_bpf_prog;
+	int pinned_bpf_prog_id;
 	char prog_path[PATH_MAX];
 	bool custom_prog_configured;
 
@@ -1097,6 +1099,106 @@ load_custom_xdp_prog(const char *prog_path, int if_index)
 	return 0;
 }
 
+static inline __u64 ptr_to_u64(const void *ptr)
+{
+	return (__u64) (unsigned long) ptr;
+}
+
+static int
+load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
+{
+	int ret, prog_fd = -1;
+	struct bpf_object *obj;
+	__u32 *map_ids;
+	int nr_maps, i;
+	struct bpf_prog_info prog_info = {};
+	__u32 prog_info_len;
+
+	prog_fd = bpf_prog_get_fd_by_id(pinned_bpf_prog_id);
+	if (prog_fd < 0) {
+		AF_XDP_LOG(ERR, "Failed to find fd associated to id: %d\n", pinned_bpf_prog_id);
+		return -1;
+	}
+
+	/*
+	 * Let's check if the program contains the same characteristics that we expect
+	 */
+	prog_info_len = sizeof(prog_info);
+	bzero(&prog_info, prog_info_len);
+	ret = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &prog_info_len);
+	if (ret != 0) {
+		AF_XDP_LOG(ERR, "Failed to get info for prog fd: %d\n", prog_fd);
+		return -1;
+	}
+
+	map_ids = calloc(prog_info.nr_map_ids, sizeof(__u32));
+	if (!map_ids) {
+		AF_XDP_LOG(ERR, "Failed alloc list for map info\n");
+		return -1;
+	}
+
+	nr_maps = prog_info.nr_map_ids;
+	bzero(&prog_info, prog_info_len);
+	prog_info.nr_map_ids = nr_maps;
+	prog_info.map_ids = ptr_to_u64(map_ids);
+	prog_info_len = sizeof(prog_info);
+	ret = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &prog_info_len);
+	if (ret != 0) {
+		AF_XDP_LOG(ERR, "Failed to get info for prog fd: %d\n", prog_fd);
+		ret = -1;
+		goto custom_pin_fail;
+	}
+
+	bool xsks_map = false;
+	for (i = 0; i < prog_info.nr_map_ids; i++) {
+		const int map_fd = bpf_map_get_fd_by_id(map_ids[i]);
+		if (map_fd >= 0) {
+			struct bpf_map_info map_info = {};
+			uint32_t map_info_len = sizeof(struct bpf_map_info);
+			if (bpf_obj_get_info_by_fd(map_fd, &map_info, &map_info_len) == 0) {
+				if (strcmp(map_info.name, "xsks_map") == 0) {
+					xsks_map = true;
+					break;
+				}
+			} else {
+				close(map_fd);
+			}
+		} else {
+			AF_XDP_LOG(ERR, "Failed to obtain map_fd for id %d: %s\n", i, strerror(errno));
+		}
+	}
+
+	/*
+	 * The loaded program must provision for a map of xsks, such that some
+	 * traffic can be redirected to userspace. When the xsk is created,
+	 * libbpf inserts it into the map.
+	 */
+	if (!xsks_map) {
+		AF_XDP_LOG(ERR, "Failed to find xsks_map in prof ID: %d\n", pinned_bpf_prog_id);
+		ret = -1;
+		goto custom_pin_fail;
+	}
+
+	/* Link the program with the given network device */
+	ret = bpf_set_link_xdp_fd(if_index, prog_fd,
+					XDP_FLAGS_UPDATE_IF_NOEXIST);
+	if (ret) {
+		AF_XDP_LOG(ERR, "Failed to set prog fd %d on interface\n",
+				prog_fd);
+		ret = -1;
+		goto custom_pin_fail;
+	}
+
+	AF_XDP_LOG(INFO, "Successfully loaded XDP program with id: %d and fd %d\n",
+				pinned_bpf_prog_id, prog_fd);
+
+	ret = 0;
+
+custom_pin_fail:
+	free(map_ids);
+	return ret;
+}
+
 static int
 xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
 	      int ring_size)
@@ -1128,6 +1230,18 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
 					   internals->if_index);
 		if (ret) {
 			AF_XDP_LOG(ERR, "Failed to load custom XDP program %s\n",
+					internals->prog_path);
+			goto err;
+		}
+		internals->custom_prog_configured = 1;
+	} else if (internals->use_pinned_bpf_prog && 
+			   !internals->custom_prog_configured) {
+
+		ret = load_custom_pinned_xdp_prog(internals->pinned_bpf_prog_id,
+					   internals->if_index);
+
+		if (ret) {
+			AF_XDP_LOG(ERR, "Failed to load custom pinned XDP program %s\n",
 					internals->prog_path);
 			goto err;
 		}
@@ -1419,7 +1533,7 @@ xdp_get_channels_info(const char *if_name, int *max_queues,
 
 static int
 parse_parameters(struct rte_kvargs *kvlist, char *if_name, int *start_queue,
-			int *queue_cnt, int *shared_umem, char *prog_path)
+			int *queue_cnt, int *shared_umem, char *prog_path, int *pinned_bpf_prog_id)
 {
 	int ret;
 
@@ -1444,6 +1558,13 @@ parse_parameters(struct rte_kvargs *kvlist, char *if_name, int *start_queue,
 				&parse_integer_arg, shared_umem);
 	if (ret < 0)
 		goto free_kvlist;
+
+	ret = rte_kvargs_process(kvlist, ETH_AF_XDP_QUEUE_COUNT_ARG,
+				 &parse_integer_arg, pinned_bpf_prog_id);
+	if (ret < 0 || *pinned_bpf_prog_id <= 0) {
+		ret = -EINVAL;
+		goto free_kvlist;
+	}
 
 	ret = rte_kvargs_process(kvlist, ETH_AF_XDP_PROG_ARG,
 				 &parse_prog_arg, prog_path);
@@ -1488,7 +1609,7 @@ error:
 static struct rte_eth_dev *
 init_internals(struct rte_vdev_device *dev, const char *if_name,
 		int start_queue_idx, int queue_cnt, int shared_umem,
-		const char *prog_path)
+		const char *prog_path, int pinned_bpf_prog_id)
 {
 	const char *name = rte_vdev_device_name(dev);
 	const unsigned int numa_node = dev->device.numa_node;
@@ -1506,6 +1627,14 @@ init_internals(struct rte_vdev_device *dev, const char *if_name,
 	strlcpy(internals->if_name, if_name, IFNAMSIZ);
 	strlcpy(internals->prog_path, prog_path, PATH_MAX);
 	internals->custom_prog_configured = 0;
+
+	if (pinned_bpf_prog_id <= 0) {
+		internals->use_pinned_bpf_prog = false;
+	} else {
+		internals->use_pinned_bpf_prog = true;
+	}
+
+	internals->pinned_bpf_prog_id = pinned_bpf_prog_id;
 
 #ifndef ETH_AF_XDP_SHARED_UMEM
 	if (shared_umem) {
@@ -1592,6 +1721,7 @@ rte_pmd_af_xdp_probe(struct rte_vdev_device *dev)
 	int xsk_queue_cnt = ETH_AF_XDP_DFLT_QUEUE_COUNT;
 	int shared_umem = 0;
 	char prog_path[PATH_MAX] = {'\0'};
+	int pinned_bpf_prog_id = 0;
 	struct rte_eth_dev *eth_dev = NULL;
 	const char *name;
 
@@ -1621,7 +1751,7 @@ rte_pmd_af_xdp_probe(struct rte_vdev_device *dev)
 		dev->device.numa_node = rte_socket_id();
 
 	if (parse_parameters(kvlist, if_name, &xsk_start_queue_idx,
-			     &xsk_queue_cnt, &shared_umem, prog_path) < 0) {
+			     &xsk_queue_cnt, &shared_umem, prog_path, &pinned_bpf_prog_id) < 0) {
 		AF_XDP_LOG(ERR, "Invalid kvargs value\n");
 		return -EINVAL;
 	}
@@ -1632,7 +1762,7 @@ rte_pmd_af_xdp_probe(struct rte_vdev_device *dev)
 	}
 
 	eth_dev = init_internals(dev, if_name, xsk_start_queue_idx,
-					xsk_queue_cnt, shared_umem, prog_path);
+					xsk_queue_cnt, shared_umem, prog_path, pinned_bpf_prog_id);
 	if (eth_dev == NULL) {
 		AF_XDP_LOG(ERR, "Failed to init internals\n");
 		return -1;
