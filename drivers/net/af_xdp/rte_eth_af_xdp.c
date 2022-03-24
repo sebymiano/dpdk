@@ -141,6 +141,7 @@ struct pmd_internals {
 #define ETH_AF_XDP_START_QUEUE_ARG		"start_queue"
 #define ETH_AF_XDP_QUEUE_COUNT_ARG		"queue_count"
 #define ETH_AF_XDP_SHARED_UMEM_ARG		"shared_umem"
+#define ETH_AF_XDP_PINNED_BPF_PROG_ID_COUNT_ARG  "pinned_xdp_prog_id"
 #define ETH_AF_XDP_PROG_ARG			"xdp_prog"
 
 static const char * const valid_arguments[] = {
@@ -148,6 +149,7 @@ static const char * const valid_arguments[] = {
 	ETH_AF_XDP_START_QUEUE_ARG,
 	ETH_AF_XDP_QUEUE_COUNT_ARG,
 	ETH_AF_XDP_SHARED_UMEM_ARG,
+	ETH_AF_XDP_PINNED_BPF_PROG_ID_COUNT_ARG,
 	ETH_AF_XDP_PROG_ARG,
 	NULL
 };
@@ -1559,7 +1561,7 @@ parse_parameters(struct rte_kvargs *kvlist, char *if_name, int *start_queue,
 	if (ret < 0)
 		goto free_kvlist;
 
-	ret = rte_kvargs_process(kvlist, ETH_AF_XDP_QUEUE_COUNT_ARG,
+	ret = rte_kvargs_process(kvlist, ETH_AF_XDP_PINNED_BPF_PROG_ID_COUNT_ARG,
 				 &parse_integer_arg, pinned_bpf_prog_id);
 	if (ret < 0 || *pinned_bpf_prog_id <= 0) {
 		ret = -EINVAL;
