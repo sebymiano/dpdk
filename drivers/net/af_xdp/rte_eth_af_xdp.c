@@ -271,7 +271,7 @@ af_xdp_rx_zc(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 
 	if (rcvd == 0) {
 #if defined(XDP_USE_NEED_WAKEUP)
-		if (xsk_ring_prod__needs_wakeup(fq))
+		// if (xsk_ring_prod__needs_wakeup(fq))
 			(void)poll(rxq->fds, 1, 1000);
 #endif
 
@@ -342,7 +342,7 @@ af_xdp_rx_cp(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	rcvd = xsk_ring_cons__peek(rx, nb_pkts, &idx_rx);
 	if (rcvd == 0) {
 #if defined(XDP_USE_NEED_WAKEUP)
-		if (xsk_ring_prod__needs_wakeup(fq))
+		// if (xsk_ring_prod__needs_wakeup(fq))
 			(void)poll(rxq->fds, 1, 1000);
 #endif
 
@@ -1121,7 +1121,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 	}
 
 	/*
-	 * Let's check if the program contains the same characteristics that we expect
+	 * Let's check if the program contains the characteristics that we expect
 	 */
 	prog_info_len = sizeof(prog_info);
 	bzero(&prog_info, prog_info_len);
@@ -1149,7 +1149,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 		goto custom_pin_fail;
 	}
 
-	bool xsks_map = false;
+	bool xsks_map_found = false;
 	for (i = 0; i < prog_info.nr_map_ids; i++) {
 		const int map_fd = bpf_map_get_fd_by_id(map_ids[i]);
 		if (map_fd >= 0) {
@@ -1157,7 +1157,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 			uint32_t map_info_len = sizeof(struct bpf_map_info);
 			if (bpf_obj_get_info_by_fd(map_fd, &map_info, &map_info_len) == 0) {
 				if (strcmp(map_info.name, "xsks_map") == 0) {
-					xsks_map = true;
+					xsks_map_found = true;
 					break;
 				}
 			} else {
@@ -1173,7 +1173,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 	 * traffic can be redirected to userspace. When the xsk is created,
 	 * libbpf inserts it into the map.
 	 */
-	if (!xsks_map) {
+	if (!xsks_map_found) {
 		AF_XDP_LOG(ERR, "Failed to find xsks_map in prof ID: %d\n", pinned_bpf_prog_id);
 		ret = -1;
 		goto custom_pin_fail;
