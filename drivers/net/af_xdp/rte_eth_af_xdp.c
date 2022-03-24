@@ -1158,6 +1158,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 			struct bpf_map_info map_info = {};
 			uint32_t map_info_len = sizeof(struct bpf_map_info);
 			if (bpf_obj_get_info_by_fd(map_fd, &map_info, &map_info_len) == 0) {
+				AF_XDP_LOG(ERR, "Found map with name: %s\n", map_info.name);
 				if (strcmp(map_info.name, "xsks_map") == 0) {
 					xsks_map_found = true;
 					break;
@@ -1176,7 +1177,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 	 * libbpf inserts it into the map.
 	 */
 	if (!xsks_map_found) {
-		AF_XDP_LOG(ERR, "Failed to find xsks_map in prof ID: %d\n", pinned_bpf_prog_id);
+		AF_XDP_LOG(ERR, "Failed to find xsks_map in prog ID: %d\n", pinned_bpf_prog_id);
 		ret = -1;
 		goto custom_pin_fail;
 	}
