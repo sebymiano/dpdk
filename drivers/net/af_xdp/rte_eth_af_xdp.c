@@ -1809,4 +1809,5 @@ RTE_PMD_REGISTER_PARAM_STRING(net_af_xdp,
 			      "start_queue=<int> "
 			      "queue_count=<int> "
 			      "shared_umem=<int> "
+				  "pinned_xdp_prog_id=<int>"
 			      "xdp_prog=<string> ");
