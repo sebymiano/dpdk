@@ -130,6 +130,7 @@ struct pmd_internals {
 	int pinned_bpf_prog_id;
 	char prog_path[PATH_MAX];
 	bool custom_prog_configured;
+	struct bpf_map *map;
 
 	struct rte_ether_addr eth_addr;
 
@@ -1063,11 +1064,10 @@ err:
 }
 
 static int
-load_custom_xdp_prog(const char *prog_path, int if_index)
+load_custom_xdp_prog(const char *prog_path, int if_index, struct bpf_map **map)
 {
 	int ret, prog_fd = -1;
 	struct bpf_object *obj;
-	struct bpf_map *map;
 
 	ret = bpf_prog_load(prog_path, BPF_PROG_TYPE_XDP, &obj, &prog_fd);
 	if (ret) {
@@ -1080,8 +1080,8 @@ load_custom_xdp_prog(const char *prog_path, int if_index)
 	 * traffic can be redirected to userspace. When the xsk is created,
 	 * libbpf inserts it into the map.
 	 */
-	map = bpf_object__find_map_by_name(obj, "xsks_map");
-	if (!map) {
+	*map = bpf_object__find_map_by_name(obj, "xsks_map");
+	if (!*map) {
 		AF_XDP_LOG(ERR, "Failed to find xsks_map in %s\n", prog_path);
 		return -1;
 	}
@@ -1107,7 +1107,7 @@ static inline __u64 ptr_to_u64(const void *ptr)
 }
 
 static int
-load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
+load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index, int *xsks_map_fd)
 {
 	int ret, prog_fd = -1;
 	struct bpf_object *obj;
@@ -1138,8 +1138,10 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 		AF_XDP_LOG(ERR, "Failed alloc list for map info\n");
 		return -1;
 	}
-
+	
 	nr_maps = prog_info.nr_map_ids;
+	AF_XDP_LOG(ERR, "Number of maps for this program is: %d\n", nr_maps);
+
 	bzero(&prog_info, prog_info_len);
 	prog_info.nr_map_ids = nr_maps;
 	prog_info.map_ids = ptr_to_u64(map_ids);
@@ -1161,6 +1163,7 @@ load_custom_pinned_xdp_prog(int pinned_bpf_prog_id, int if_index)
 				AF_XDP_LOG(ERR, "Found map with name: %s\n", map_info.name);
 				if (strcmp(map_info.name, "xsks_map") == 0) {
 					xsks_map_found = true;
+					*xsks_map_fd = map_fd;
 					break;
 				}
 			} else {
@@ -1211,6 +1214,7 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
 	int ret = 0;
 	int reserve_size = ETH_AF_XDP_DFLT_NUM_DESCS;
 	struct rte_mbuf *fq_bufs[reserve_size];
+	int xsks_map_fd = -1;
 
 	rxq->umem = xdp_umem_configure(internals, rxq);
 	if (rxq->umem == NULL)
@@ -1227,28 +1231,33 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
 	cfg.bind_flags |= XDP_USE_NEED_WAKEUP;
 #endif
 
-	if (strnlen(internals->prog_path, PATH_MAX) &&
-				!internals->custom_prog_configured) {
-		ret = load_custom_xdp_prog(internals->prog_path,
-					   internals->if_index);
-		if (ret) {
-			AF_XDP_LOG(ERR, "Failed to load custom XDP program %s\n",
-					internals->prog_path);
-			goto err;
+	if (strnlen(internals->prog_path, PATH_MAX)) {
+		if (!internals->custom_prog_configured) {
+			ret = load_custom_xdp_prog(internals->prog_path,
+									   internals->if_index,
+									   &internals->map);
+			if (ret) {
+				AF_XDP_LOG(ERR, "Failed to load custom XDP program %s\n",
+						internals->prog_path);
+				goto err;
+			}
+			internals->custom_prog_configured = 1;
 		}
-		internals->custom_prog_configured = 1;
-	} else if (internals->use_pinned_bpf_prog && 
-			   !internals->custom_prog_configured) {
+		cfg.libbpf_flags |= XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+	} else if (internals->use_pinned_bpf_prog) {
+		if(!internals->custom_prog_configured) {
+			ret = load_custom_pinned_xdp_prog(internals->pinned_bpf_prog_id,
+											  internals->if_index,
+											  &xsks_map_fd);
 
-		ret = load_custom_pinned_xdp_prog(internals->pinned_bpf_prog_id,
-					   internals->if_index);
-
-		if (ret) {
-			AF_XDP_LOG(ERR, "Failed to load custom pinned XDP program %s\n",
-					internals->prog_path);
-			goto err;
+			if (ret) {
+				AF_XDP_LOG(ERR, "Failed to load custom pinned XDP program %s\n",
+						internals->prog_path);
+				goto err;
+			}
+			internals->custom_prog_configured = 1;
 		}
-		internals->custom_prog_configured = 1;
+		cfg.libbpf_flags |= XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	}
 
 	if (internals->shared_umem)
@@ -1278,7 +1287,25 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
 		goto err;
 	}
 
+	/* insert the xsk into the xsks_map */
+	if (internals->custom_prog_configured) {
+		int err, fd;
+
+		fd = xsk_socket__fd(rxq->xsk);
+		if (!internals->use_pinned_bpf_prog) {
+			xsks_map_fd = bpf_map__fd(internals->map);
+		}
+		err = bpf_map_update_elem(xsks_map_fd, &rxq->xsk_queue_idx, &fd, 0);
+		if (err) {
+			AF_XDP_LOG(ERR, "Failed to insert xsk in map.\n");
+			goto out_xsk;
+		}
+	}
+
 	return 0;
+
+out_xsk:
+	xsk_socket__delete(rxq->xsk);
 
 err:
 	if (__atomic_sub_fetch(&rxq->umem->refcnt, 1, __ATOMIC_ACQUIRE) == 0)
